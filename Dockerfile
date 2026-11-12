@@ -1,5 +1,7 @@
-# Builder: rust 1.82 slim + only the toolchain pieces ring/rustls need (cc, make).
-FROM rust:1.82-slim AS builder
+# Builder: rust 1.96 (matches the toolchain that produced Cargo.lock; >=1.85 is
+# required because transitive dep icu_collections needs edition2024) + the C
+# toolchain ring/rustls need.
+FROM rust:1.96-slim AS builder
 WORKDIR /app
 RUN apt-get update \
  && apt-get install -y --no-install-recommends build-essential \

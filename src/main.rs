@@ -246,6 +246,10 @@ impl EventHandler for Handler {
             eprintln!("warn: empty prompt (mention-only or MESSAGE_CONTENT intent not granted)");
             return;
         }
+        // Bỏ qua tin chỉ có emoji/sticker (kênh này mọi người hay thả <:Seia:...>).
+        if !prompt.chars().any(|c| c.is_alphanumeric()) {
+            return;
+        }
 
         if let Err(err) = msg.channel_id.broadcast_typing(&ctx.http).await {
             eprintln!("typing failed: {err}");

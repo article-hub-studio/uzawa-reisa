@@ -1,0 +1,18 @@
+services:
+  - type: worker
+    name: uzawa-reisa
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: starter
+    region: singapore
+    autoDeploy: true
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: NINEROUTER_API_KEY
+        sync: false
+      - key: NINEROUTER_BASE_URL
+        value: https://ninerouterhoang.onrender.com/v1
+      - key: NINEROUTER_MODEL
+        value: openrouter/openrouter/free

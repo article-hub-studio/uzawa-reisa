@@ -95,7 +95,9 @@ impl Config {
         let body = serde_json::json!({
             "model": self.model,
             "messages": messages,
-            "max_tokens": 512,
+            // ponytail: router free hay chọn model reasoning, budget nhỏ là hết token vào
+            // phần reasoning và content trả về null -> 2048 mới đủ chỗ cho câu trả lời.
+            "max_tokens": 2048,
             "temperature": 0.9,
         });
 
@@ -115,18 +117,7 @@ impl Config {
                     if !status.is_success() {
                         return Err(format!("HTTP {status}: {}", truncate(&text, 200)));
                     }
-                    let parsed: Completion = serde_json::from_str(&text)
-                        .map_err(|e| format!("bad JSON: {e}: {}", truncate(&text, 200)))?;
-                    let content = parsed
-                        .choices
-                        .into_iter()
-                        .next()
-                        .and_then(|c| c.message.content)
-                        .unwrap_or_default();
-                    let content = content.trim().to_string();
-                    if content.is_empty() {
-                        return Err("empty content from API".to_string());
-                    }
+                    let content = parse_content(&text)?;
                     return Ok(content);
                 }
                 Err(e) => last_err = format!("transport: {e}"),
@@ -137,6 +128,29 @@ impl Config {
         }
         Err(last_err)
     }
+}
+
+/// ponytail: ninerouter nối sentinel `data: [DONE]` sau JSON body, nên `from_str()` fail
+/// "trailing characters". Lấy giá trị JSON đầu tiên, bỏ phần còn lại.
+fn parse_content(text: &str) -> Result<String, String> {
+    let parsed: Completion = serde_json::Deserializer::from_str(text.trim_start())
+        .into_iter::<Completion>()
+        .next()
+        .ok_or_else(|| format!("empty body: {}", truncate(text, 200)))?
+        .map_err(|e| format!("bad JSON: {e}: {}", truncate(text, 200)))?;
+    let content = parsed
+        .choices
+        .into_iter()
+        .next()
+        .and_then(|c| c.message.content)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if content.is_empty() {
+        // Router free đôi khi trả content null (model chỉ sinh reasoning rồi hết budget).
+        return Err("empty content from API".to_string());
+    }
+    Ok(content)
 }
 
 struct Handler {
@@ -293,5 +307,36 @@ async fn main() {
     if let Err(err) = client.start().await {
         eprintln!("client error: {err}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Body thật của ninerouter: JSON + sentinel `data: [DONE]` (đã cắt phần reasoning).
+    const REAL: &str = "\n         \n{\"id\":\"gen-1\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Dạ em chào sensei yêu quý~\"},\"finish_reason\":\"stop\"}]}data: [DONE]\n\n";
+
+    #[test]
+    fn parses_body_with_trailing_done_sentinel() {
+        assert_eq!(parse_content(REAL).unwrap(), "Dạ em chào sensei yêu quý~");
+    }
+
+    #[test]
+    fn rejects_null_content() {
+        let null = "{\"choices\":[{\"message\":{\"content\":null,\"reasoning\":\"...\"}}]}data: [DONE]";
+        assert!(parse_content(null).is_err());
+    }
+
+    #[test]
+    fn chunks_long_replies() {
+        let chunks = split_message(&"a".repeat(4500));
+        assert_eq!(chunks.iter().map(|c| c.chars().count()).collect::<Vec<_>>(), vec![2000, 2000, 500]);
+    }
+
+    #[test]
+    fn strips_bot_mention() {
+        let id = UserId::new(1570293369844932728);
+        assert_eq!(strip_mentions(&format!("<@{id}> chào em"), id).trim(), "chào em");
     }
 }

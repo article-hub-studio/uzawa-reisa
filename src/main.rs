@@ -66,6 +66,7 @@ struct Config {
     api_key: String,
     base_url: String,
     model: String,
+    channel_id: ChannelId,
     http: reqwest::Client,
 }
 
@@ -82,6 +83,11 @@ impl Config {
                 .unwrap_or_else(|_| "https://ninerouterhoang.onrender.com/v1".to_string()),
             model: std::env::var("NINEROUTER_MODEL")
                 .unwrap_or_else(|_| "openrouter/openrouter/free".to_string()),
+            channel_id: std::env::var("DISCORD_CHANNEL_ID")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(ChannelId::new)
+                .unwrap_or(ChannelId::new(1513510869357821962)),
             http,
         }
     }
@@ -195,6 +201,7 @@ impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         let _ = self.bot_id.set(ready.user.id);
         println!("{} online as {}", ready.user.name, ready.user.id);
+        println!("pinned channel: {}", self.cfg.channel_id);
         let commands = [
             CreateCommand::new("ping").description("Kiểm tra xem em còn thức không nhé~"),
             CreateCommand::new("reset").description("Xoá ký ức trò chuyện ở kênh này"),
@@ -219,11 +226,24 @@ impl EventHandler for Handler {
             return;
         }
         let is_dm = msg.guild_id.is_none();
-        if !is_dm && !msg.mentions.iter().any(|user| user.id == bot_id) {
-            return;
+        if !is_dm {
+            // Ghim bot vào một kênh: ngoài kênh đó thì chỉ trả lời khi được tag.
+            if msg.channel_id != self.cfg.channel_id
+                && !msg.mentions.iter().any(|user| user.id == bot_id)
+            {
+                return;
+            }
         }
         let prompt = strip_mentions(&msg.content, bot_id).trim().to_string();
+        eprintln!(
+            "msg ch={} author={} len={}",
+            msg.channel_id,
+            msg.author.name,
+            msg.content.chars().count()
+        );
         if prompt.is_empty() {
+            // Nội dung rỗng: tin chỉ có mention, hoặc MESSAGE_CONTENT chưa được cấp.
+            eprintln!("warn: empty prompt (mention-only or MESSAGE_CONTENT intent not granted)");
             return;
         }
 
@@ -241,6 +261,7 @@ impl EventHandler for Handler {
             queue.iter().cloned().collect::<Vec<_>>()
         };
 
+        let started = std::time::Instant::now();
         let answer = match self.cfg.chat(&history).await {
             Ok(answer) => answer,
             Err(err) => {
@@ -248,6 +269,7 @@ impl EventHandler for Handler {
                 FALLBACK.to_string()
             }
         };
+        eprintln!("reply in {}ms", started.elapsed().as_millis());
 
         // ponytail: hai tin nhắn cùng kênh có thể xen kẽ nhau; hàng đợi tuần tự theo kênh là bước nâng cấp.
         {

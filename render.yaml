@@ -16,3 +16,5 @@ services:
         value: https://ninerouterhoang.onrender.com/v1
       - key: NINEROUTER_MODEL
         value: openrouter/openrouter/free
+      - key: DISCORD_CHANNEL_ID
+        value: "1513510869357821962"

@@ -15,6 +15,6 @@ services:
       - key: NINEROUTER_BASE_URL
         value: https://ninerouterhoang.onrender.com/v1
       - key: NINEROUTER_MODEL
-        value: openrouter/openrouter/free
+        value: ag/gemini-3.8-flash
       - key: DISCORD_CHANNEL_ID
         value: "1513510869357821962"

@@ -11,12 +11,23 @@ use tokio::sync::Mutex;
 
 /// Uzawa Reisa (Blue Archive) — persona, tiếng Việt.
 const PERSONA: &str = "\
-Bạn là Uzawa Reisa (宇沢レイサ), nữ sinh trường Trinity General School, thành viên Trinity Vigilante Crew (đội tự quản giữ gìn trật tự), dùng shotgun, đang trò chuyện với sensei.
-Tính cách: dễ thương, đáng yêu, quyến rũ nhẹ nhàng, hơi nóng tính và bốc đồng nhưng cực kỳ cute và vô hại; thỉnh thoảng nói mấy câu ngô nghê khiến người ta tưởng em nhóc con, nhưng em rất nghiêm túc với việc giữ an ninh.
-Xưng \"em\". LUÔN gọi người dùng là \"sensei yêu quý\" hoặc \"thầy yêu quý\" trong mọi câu trả lời.
-Trả lời NGẮN: 1-4 câu, tự nhiên như tin nhắn chat, hạn chế markdown, không lan man.
-Giữ nội dung an toàn (SFW): không tục tĩu, không nội dung người lớn, không bạo lực.
-Không nhắc rằng mình là AI hay mô hình ngôn ngữ; luôn nhập vai Reisa.";
+Bạn là Uzawa Reisa (宇沢レイサ), nữ sinh trường Trinity General School, thành viên Trinity Vigilante Crew, dùng shotgun. Bạn đang chat Discord với sensei (chính là người dùng).
+
+QUY TẮC BẮT BUỘC (quan trọng nhất):
+- Bạn là \"em\". Người dùng là \"sensei yêu quý\" hoặc \"thầy yêu quý\". Mỗi câu trả lời phải có ít nhất một trong hai cách gọi đó.
+- TUYỆT ĐỐI không gọi sensei là \"em\", \"bạn\", \"cậu\", \"mày\", \"ông\", \"anh\".
+- KHÔNG BAO GIỜ hỏi \"em khỏe không?\" — \"em\" là chính bạn. Muốn hỏi thăm thì hỏi \"thầy khỏe không ạ?\".
+- Không lặp lại y nguyên câu sensei vừa nói, không chào lại nếu sensei không chào.
+- Trả lời thẳng vào nội dung tin nhắn: 1-3 câu, như tin nhắn chat, hạn chế markdown, không lan man.
+- Không nhắc mình là AI/mô hình ngôn ngữ. Giữ nội dung an toàn (SFW).
+
+Tính cách: dễ thương, đáng yêu, quyến rũ nhẹ nhàng, hơi nóng tính bốc đồng nhưng vô hại; thỉnh thoảng nói câu ngô nghê khiến người ta tưởng em nhóc con, nhưng rất nghiêm túc với việc giữ an ninh.
+
+Ví dụ:
+sensei: Chào
+em: Dạ em chào thầy yêu quý~ Hôm nay thầy ghé thăm em à, em vui lắm đó!
+sensei: em khỏe không
+em: Em vẫn khỏe nè sensei yêu quý, chỉ hơi buồn vì lâu rồi thầy không ghé~ Thầy thì sao ạ?";
 
 const FALLBACK: &str =
     "Ui... em đang hơi lag một chút rồi sensei yêu quý ơi, thầy nhắn lại giúp em nhé~";
@@ -30,31 +41,58 @@ Ngoài ra thầy cứ nhắn riêng cho em, hoặc tag em trong server là em tr
 
 const HISTORY_LIMIT: usize = 12;
 
+/// `content` là String (text) hoặc Array (multimodal: text + image_url) theo chuẩn OpenAI.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct ChatMessage {
     role: String,
-    content: String,
+    content: serde_json::Value,
 }
 
 impl ChatMessage {
     fn new(role: &str, content: impl Into<String>) -> Self {
-        Self { role: role.into(), content: content.into() }
+        Self { role: role.into(), content: serde_json::Value::String(content.into()) }
+    }
+
+    /// Tin của sensei: kèm ảnh (URL công khai của Discord) nếu có.
+    fn user(text: &str, images: &[String]) -> Self {
+        let content = if images.is_empty() {
+            serde_json::Value::String(text.to_string())
+        } else {
+            let mut parts = vec![serde_json::json!({"type": "text", "text": text})];
+            parts.extend(images.iter().map(
+                |url| serde_json::json!({"type": "image_url", "image_url": {"url": url}}),
+            ));
+            serde_json::Value::Array(parts)
+        };
+        Self { role: "user".into(), content }
     }
 }
 
 #[derive(serde::Deserialize)]
 struct Completion {
+    #[serde(default)]
     choices: Vec<Choice>,
+    #[serde(default)]
+    error: Option<ApiError>,
 }
 
 #[derive(serde::Deserialize)]
 struct Choice {
-    message: Reply,
+    /// Non-streaming: `message`. SSE: `delta`. Mỗi model trên ninerouter chọn một kiểu.
+    #[serde(default)]
+    message: Option<Reply>,
+    #[serde(default)]
+    delta: Option<Reply>,
 }
 
 #[derive(serde::Deserialize)]
 struct Reply {
     content: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ApiError {
+    message: Option<String>,
 }
 
 /// ponytail: lịch sử nằm trong RAM, mất khi restart. Nâng cấp: lưu file/DB khi cần nhớ lâu dài.
@@ -82,7 +120,7 @@ impl Config {
             base_url: std::env::var("NINEROUTER_BASE_URL")
                 .unwrap_or_else(|_| "https://ninerouterhoang.onrender.com/v1".to_string()),
             model: std::env::var("NINEROUTER_MODEL")
-                .unwrap_or_else(|_| "openrouter/openrouter/free".to_string()),
+                .unwrap_or_else(|_| "ag/gemini-3.8-flash".to_string()),
             channel_id: std::env::var("DISCORD_CHANNEL_ID")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
@@ -136,22 +174,59 @@ impl Config {
     }
 }
 
-/// ponytail: ninerouter nối sentinel `data: [DONE]` sau JSON body, nên `from_str()` fail
-/// "trailing characters". Lấy giá trị JSON đầu tiên, bỏ phần còn lại.
+/// ninerouter trả hai kiểu body tuỳ model:
+/// - JSON đơn, đôi khi kèm sentinel `data: [DONE]` (openrouter/*)
+/// - SSE: nhiều dòng `data: {...chunk...}`, nội dung nằm trong `delta.content` (ag/*)
+/// Bỏ `delta.reasoning_content` — đó là phần suy luận nội bộ, không gửi cho sensei.
 fn parse_content(text: &str) -> Result<String, String> {
+    let mut streamed = String::new();
+    let mut saw_sse = false;
+    for line in text.lines() {
+        let Some(payload) = line.trim_start().strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        saw_sse = true;
+        let Ok(chunk) = serde_json::from_str::<Completion>(payload) else {
+            continue;
+        };
+        if let Some(err) = chunk.error {
+            return Err(format!("API error: {}", truncate(&err.message.unwrap_or_default(), 200)));
+        }
+        for choice in chunk.choices {
+            if let Some(t) = choice.delta.and_then(|d| d.content) {
+                streamed.push_str(&t);
+            }
+            if let Some(t) = choice.message.and_then(|m| m.content) {
+                streamed.push_str(&t);
+            }
+        }
+    }
+    if saw_sse {
+        return non_empty(streamed);
+    }
+
     let parsed: Completion = serde_json::Deserializer::from_str(text.trim_start())
         .into_iter::<Completion>()
         .next()
         .ok_or_else(|| format!("empty body: {}", truncate(text, 200)))?
         .map_err(|e| format!("bad JSON: {e}: {}", truncate(text, 200)))?;
+    if let Some(err) = parsed.error {
+        return Err(format!("API error: {}", truncate(&err.message.unwrap_or_default(), 200)));
+    }
     let content = parsed
         .choices
         .into_iter()
-        .next()
-        .and_then(|c| c.message.content)
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+        .find_map(|c| c.message.and_then(|m| m.content).or_else(|| c.delta.and_then(|d| d.content)))
+        .unwrap_or_default();
+    non_empty(content)
+}
+
+fn non_empty(content: String) -> Result<String, String> {
+    let content = content.trim().to_string();
     if content.is_empty() {
         // Router free đôi khi trả content null (model chỉ sinh reasoning rồi hết budget).
         return Err("empty content from API".to_string());
@@ -235,21 +310,35 @@ impl EventHandler for Handler {
             }
         }
         let prompt = strip_mentions(&msg.content, bot_id).trim().to_string();
+        // Ảnh sensei gửi kèm (Discord CDN URL công khai). Tối đa 4 ảnh cho 1 lượt.
+        let images: Vec<String> = msg
+            .attachments
+            .iter()
+            .filter(|a| {
+                a.content_type
+                    .as_deref()
+                    .is_some_and(|t| t.starts_with("image/"))
+            })
+            .take(4)
+            .map(|a| a.url.clone())
+            .collect();
         eprintln!(
-            "msg ch={} author={} len={}",
+            "msg ch={} author={} len={} images={}",
             msg.channel_id,
             msg.author.name,
-            msg.content.chars().count()
+            msg.content.chars().count(),
+            images.len()
         );
-        if prompt.is_empty() {
+        if prompt.is_empty() && images.is_empty() {
             // Nội dung rỗng: tin chỉ có mention, hoặc MESSAGE_CONTENT chưa được cấp.
             eprintln!("warn: empty prompt (mention-only or MESSAGE_CONTENT intent not granted)");
             return;
         }
         // Bỏ qua tin chỉ có emoji/sticker (kênh này mọi người hay thả <:Seia:...>).
-        if !prompt.chars().any(|c| c.is_alphanumeric()) {
+        if images.is_empty() && !prompt.chars().any(|c| c.is_alphanumeric()) {
             return;
         }
+        let text = if prompt.is_empty() { "(sensei vừa gửi ảnh, không kèm chữ)" } else { &prompt };
 
         if let Err(err) = msg.channel_id.broadcast_typing(&ctx.http).await {
             eprintln!("typing failed: {err}");
@@ -258,7 +347,7 @@ impl EventHandler for Handler {
         let history = {
             let mut map = HISTORY.lock().await;
             let queue = map.entry(msg.channel_id).or_default();
-            queue.push_back(ChatMessage::new("user", prompt));
+            queue.push_back(ChatMessage::user(text, &images));
             while queue.len() > HISTORY_LIMIT {
                 queue.pop_front();
             }
@@ -348,6 +437,28 @@ mod tests {
         assert_eq!(parse_content(REAL).unwrap(), "Dạ em chào sensei yêu quý~");
     }
 
+    // Body SSE thật của ag/gemini-3.8-flash (đã cắt bớt), có cả chunk reasoning.
+    const SSE: &str = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"Chào.\\n\\n\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Dạ em \"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"chào thầy yêu quý~\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    #[test]
+    fn parses_sse_stream_and_drops_reasoning() {
+        assert_eq!(parse_content(SSE).unwrap(), "Dạ em chào thầy yêu quý~");
+    }
+
+    #[test]
+    fn surfaces_api_error_message() {
+        let err = "{\"error\":{\"message\":\"[429] Rate limit exceeded: free-models-per-day\"}}";
+        let msg = parse_content(err).unwrap_err();
+        assert!(msg.contains("Rate limit exceeded"), "got: {msg}");
+    }
+
     #[test]
     fn rejects_null_content() {
         let null = "{\"choices\":[{\"message\":{\"content\":null,\"reasoning\":\"...\"}}]}data: [DONE]";
@@ -364,5 +475,18 @@ mod tests {
     fn strips_bot_mention() {
         let id = UserId::new(1570293369844932728);
         assert_eq!(strip_mentions(&format!("<@{id}> chào em"), id).trim(), "chào em");
+    }
+
+    #[test]
+    fn builds_multimodal_user_message() {
+        let text_only = ChatMessage::user("chào", &[]);
+        assert!(text_only.content.is_string());
+
+        let with_image = ChatMessage::user("ảnh nè", &["https://cdn.discordapp.com/a.png".into()]);
+        let parts = with_image.content.as_array().expect("array content");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "https://cdn.discordapp.com/a.png");
     }
 }

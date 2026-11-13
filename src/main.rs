@@ -1,15 +1,19 @@
+mod prompt;
+mod websearch;
+
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 
 use serenity::all::{
-    ChannelId, Command, Context, CreateCommand, CreateInteractionResponse,
-    CreateInteractionResponseMessage, EventHandler, GatewayIntents, Interaction, Message, Ready,
-    UserId,
+    ChannelId, Command, CommandOptionType, Context, CreateCommand, CreateCommandOption,
+    CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
+    EventHandler, GatewayIntents, Interaction, Message, Ready, UserId,
 };
 use tokio::sync::Mutex;
 
-/// Uzawa Reisa (Blue Archive) — persona, tiếng Việt.
+/// Fallback khi không đọc được `prompts/*.md`.
 const PERSONA: &str = "\
 Bạn là Uzawa Reisa (宇沢レイサ), nữ sinh trường Trinity General School, thành viên Trinity Vigilante Crew, dùng shotgun. Bạn đang chat Discord với sensei (chính là người dùng).
 
@@ -36,8 +40,10 @@ const HELP: &str = "\
 Em giúp được cho thầy yêu quý mấy thứ này nè:
 • `/ping` — kiểm tra em còn thức không~
 • `/reset` — xoá ký ức trò chuyện ở kênh này
+• `/search <từ khoá>` — em tra tin mới trên web rồi tóm tắt kèm nguồn
 • `/help` — xem lại danh sách này
-Ngoài ra thầy cứ nhắn riêng cho em, hoặc tag em trong server là em trả lời liền!";
+Ngoài ra thầy cứ nhắn riêng cho em, hoặc tag em trong server là em trả lời liền!
+Em cũng đọc được ảnh thầy gửi, và tự tra web khi thầy hỏi tin tức / thời tiết / giá cả.";
 
 const HISTORY_LIMIT: usize = 12;
 
@@ -105,8 +111,24 @@ struct Config {
     base_url: String,
     model: String,
     channel_id: ChannelId,
+    /// Instruction/skill nạp từ `prompts/*.md` (hoặc fallback nhúng).
+    system: String,
+    /// Gộp các tin nhắn đến trong cùng khoảng này thành 1 prompt.
+    group_window: Duration,
     http: reqwest::Client,
 }
+
+/// ponytail: gộp tin theo kênh, chưa tách theo người gửi. Tách theo author khi cần.
+#[derive(Default)]
+struct Pending {
+    generation: u64,
+    lines: Vec<String>,
+    images: Vec<String>,
+}
+
+static PENDING: LazyLock<Mutex<HashMap<ChannelId, Pending>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 impl Config {
     fn from_env() -> Self {
@@ -114,6 +136,12 @@ impl Config {
             .timeout(Duration::from_secs(60))
             .build()
             .expect("failed to build HTTP client");
+        let (system, source) = prompt::load(PERSONA);
+        println!("system prompt: {} ({} ký tự)", source, system.chars().count());
+        let group_window = std::env::var("DISCORD_GROUP_WINDOW_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(2000);
         Self {
             token: std::env::var("DISCORD_BOT_TOKEN").expect("DISCORD_BOT_TOKEN is not set"),
             api_key: std::env::var("NINEROUTER_API_KEY").expect("NINEROUTER_API_KEY is not set"),
@@ -126,6 +154,8 @@ impl Config {
                 .and_then(|v| v.parse::<u64>().ok())
                 .map(ChannelId::new)
                 .unwrap_or(ChannelId::new(1513510869357821962)),
+            system,
+            group_window: Duration::from_millis(group_window),
             http,
         }
     }
@@ -134,7 +164,7 @@ impl Config {
     async fn chat(&self, history: &[ChatMessage]) -> Result<String, String> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let mut messages = Vec::with_capacity(history.len() + 1);
-        messages.push(ChatMessage::new("system", PERSONA));
+        messages.push(ChatMessage::new("system", &self.system));
         messages.extend_from_slice(history);
         let body = serde_json::json!({
             "model": self.model,
@@ -246,10 +276,91 @@ fn truncate(text: &str, max: usize) -> String {
     text.chars().take(max).collect::<String>() + "..."
 }
 
-fn strip_mentions(content: &str, bot_id: UserId) -> String {
-    content
-        .replace(&format!("<@{bot_id}>"), "")
-        .replace(&format!("<@!{bot_id}>"), "")
+/// Biến nội dung tin nhắn thô thành thứ Reisa "đọc" được:
+/// - `<:Ten:id>` / `<a:Ten:id>` -> `:Ten:` (để em ấy hiểu emoji, không phải bỏ qua)
+/// - `<@id>` -> `@Tên`, mention chính bot thì bỏ
+/// - `<@&id>` (role), `<#id>` (kênh) giữ nguyên dạng gọn
+/// Trả kèm cờ `has_text`: tin chỉ có emoji/mention thì không có nội dung thật.
+fn render_content(content: &str, bot_id: UserId, mentions: &[serenity::model::user::User]) -> (String, bool) {
+    let mut out = String::with_capacity(content.len());
+    let mut has_text = false;
+    let mut rest = content;
+
+    while let Some(start) = rest.find('<') {
+        let (before, tail) = rest.split_at(start);
+        out.push_str(before);
+        has_text |= before.chars().any(|c| c.is_alphanumeric());
+
+        let Some(end) = tail.find('>') else {
+            out.push_str(tail);
+            rest = "";
+            break;
+        };
+        let token = &tail[..=end];
+        let inner = &tail[1..end];
+
+        if let Some(name) = emoji_name(inner) {
+            out.push(':');
+            out.push_str(name);
+            out.push(':');
+        } else if let Some(id) = inner.strip_prefix('@').map(|r| r.strip_prefix('!').unwrap_or(r)) {
+            if id.parse::<u64>() == Ok(bot_id.get()) {
+                // mention chính bot: bỏ hẳn, không tính là nội dung
+            } else if let Some(user) = id
+                .parse::<u64>()
+                .ok()
+                .and_then(|id| mentions.iter().find(|u| u.id.get() == id))
+            {
+                out.push('@');
+                out.push_str(&user.name);
+            } else {
+                out.push_str("@ai_do");
+            }
+        } else {
+            // role, channel, hoặc cú pháp khác: giữ nguyên
+            out.push_str(token);
+            has_text |= token.chars().any(|c| c.is_alphanumeric());
+        }
+        rest = &tail[end + 1..];
+    }
+    out.push_str(rest);
+    has_text |= rest.chars().any(|c| c.is_alphanumeric());
+
+    (out.trim().to_string(), has_text)
+}
+
+/// `:name:id` (emoji thường) hoặc `a:name:id` (emoji động) -> `name`.
+/// Đây là phần bên trong của `<...>`, nên luôn có dấu `:` trước tên.
+fn emoji_name(inner: &str) -> Option<&str> {
+    let inner = inner.strip_prefix('a').unwrap_or(inner);
+    let inner = inner.strip_prefix(':')?;
+    let (name, id) = inner.split_once(':')?;
+    let name_ok = !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_');
+    let id_ok = !id.is_empty() && id.chars().all(|c| c.is_ascii_digit());
+    (name_ok && id_ok).then_some(name)
+}
+
+/// Lấy ảnh sensei gửi (bỏ GIF/sticker động — chỉ nhận ảnh tĩnh).
+fn image_urls(msg: &Message) -> Vec<String> {
+    msg.attachments
+        .iter()
+        .filter(|a| {
+            a.content_type
+                .as_deref()
+                .is_some_and(|t| t.starts_with("image/") && t != "image/gif")
+        })
+        .take(4)
+        .map(|a| a.url.clone())
+        .collect()
+}
+
+/// Chờ hết cửa sổ gộp tin rồi lấy cả cụm; trả None nếu đã có tin mới hơn tiếp quản.
+async fn take_ready(channel: ChannelId, generation: u64) -> Option<Pending> {
+    let mut map = PENDING.lock().await;
+    match map.get(&channel) {
+        Some(pending) if pending.generation == generation => map.remove(&channel),
+        _ => None,
+    }
 }
 
 fn split_message(text: &str) -> Vec<String> {
@@ -281,6 +392,16 @@ impl EventHandler for Handler {
             CreateCommand::new("ping").description("Kiểm tra xem em còn thức không nhé~"),
             CreateCommand::new("reset").description("Xoá ký ức trò chuyện ở kênh này"),
             CreateCommand::new("help").description("Em giúp được gì cho thầy yêu quý?"),
+            CreateCommand::new("search")
+                .description("Nhờ em tra thông tin mới trên web")
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "tu_khoa",
+                        "Thầy muốn em tìm gì ạ?",
+                    )
+                    .required(true),
+                ),
         ];
         for command in commands {
             if let Err(err) = Command::create_global_command(&ctx.http, command).await {
@@ -309,82 +430,179 @@ impl EventHandler for Handler {
                 return;
             }
         }
-        let prompt = strip_mentions(&msg.content, bot_id).trim().to_string();
-        // Ảnh sensei gửi kèm (Discord CDN URL công khai). Tối đa 4 ảnh cho 1 lượt.
-        let images: Vec<String> = msg
-            .attachments
-            .iter()
-            .filter(|a| {
-                a.content_type
-                    .as_deref()
-                    .is_some_and(|t| t.starts_with("image/"))
-            })
-            .take(4)
-            .map(|a| a.url.clone())
-            .collect();
+        let (text, has_text) = render_content(&msg.content, bot_id, &msg.mentions);
+        let images = image_urls(&msg);
         eprintln!(
-            "msg ch={} author={} len={} images={}",
+            "msg ch={} author={} len={} images={} stickers={}",
             msg.channel_id,
             msg.author.name,
             msg.content.chars().count(),
-            images.len()
+            images.len(),
+            msg.sticker_items.len()
         );
-        if prompt.is_empty() && images.is_empty() {
-            // Nội dung rỗng: tin chỉ có mention, hoặc MESSAGE_CONTENT chưa được cấp.
-            eprintln!("warn: empty prompt (mention-only or MESSAGE_CONTENT intent not granted)");
+
+        // Lọc nhanh: sticker/GIF thuần, tin chỉ có emoji, tin rỗng.
+        if msg.sticker_items.is_empty() == false && text.is_empty() && images.is_empty() {
+            eprintln!("skip: sticker");
             return;
         }
-        // Bỏ qua tin chỉ có emoji/sticker (kênh này mọi người hay thả <:Seia:...>).
-        if images.is_empty() && !prompt.chars().any(|c| c.is_alphanumeric()) {
+        if text.is_empty() && images.is_empty() {
+            eprintln!("skip: empty (mention-only, GIF, hoặc MESSAGE_CONTENT chưa cấp)");
             return;
         }
-        let text = if prompt.is_empty() { "(sensei vừa gửi ảnh, không kèm chữ)" } else { &prompt };
-
-        if let Err(err) = msg.channel_id.broadcast_typing(&ctx.http).await {
-            eprintln!("typing failed: {err}");
+        if images.is_empty() && !has_text {
+            eprintln!("skip: chỉ có emoji");
+            return;
         }
 
-        let history = {
-            let mut map = HISTORY.lock().await;
-            let queue = map.entry(msg.channel_id).or_default();
-            queue.push_back(ChatMessage::user(text, &images));
-            while queue.len() > HISTORY_LIMIT {
-                queue.pop_front();
-            }
-            queue.iter().cloned().collect::<Vec<_>>()
+        // Biết tên người nhắn (nick trong server) để Reisa gọi đúng người.
+        let name = msg
+            .member
+            .as_ref()
+            .and_then(|m| m.nick.clone())
+            .or_else(|| msg.author.global_name.clone())
+            .unwrap_or_else(|| msg.author.name.clone());
+        let line = if text.is_empty() {
+            format!("{name}: (vừa gửi ảnh, không kèm chữ)")
+        } else {
+            format!("{name}: {text}")
         };
 
-        let started = std::time::Instant::now();
-        let answer = match self.cfg.chat(&history).await {
-            Ok(answer) => answer,
-            Err(err) => {
-                eprintln!("chat error: {err}");
-                FALLBACK.to_string()
-            }
+        // Gộp các tin đến liên tiếp trong cửa sổ group_window thành 1 prompt.
+        let generation = {
+            let mut map = PENDING.lock().await;
+            let pending = map.entry(msg.channel_id).or_default();
+            pending.generation = GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+            pending.lines.push(line);
+            pending.images.extend(images);
+            pending.images.truncate(4);
+            pending.generation
         };
-        eprintln!("reply in {}ms", started.elapsed().as_millis());
+        let _ = msg.channel_id.broadcast_typing(&ctx.http).await;
 
-        // ponytail: hai tin nhắn cùng kênh có thể xen kẽ nhau; hàng đợi tuần tự theo kênh là bước nâng cấp.
-        {
-            let mut map = HISTORY.lock().await;
-            let queue = map.entry(msg.channel_id).or_default();
-            queue.push_back(ChatMessage::new("assistant", answer.clone()));
-            while queue.len() > HISTORY_LIMIT {
-                queue.pop_front();
-            }
-        }
+        let ctx = ctx.clone();
+        let cfg = self.cfg.clone();
+        let channel = msg.channel_id;
+        let window = self.cfg.group_window;
+        tokio::spawn(async move {
+            tokio::time::sleep(window).await;
+            // Có tin mới hơn trong lúc chờ -> nhường lượt cho task đó.
+            let Some(pending) = take_ready(channel, generation).await else {
+                return;
+            };
+            let prompt = pending.lines.join("\n");
+            eprintln!(
+                "grouped {} tin -> {} ký tự, {} ảnh",
+                pending.lines.len(),
+                prompt.chars().count(),
+                pending.images.len()
+            );
+            // Tự tra web khi sensei hỏi thứ cần dữ liệu mới.
+            let prompt = if websearch::wants_search(&prompt) {
+                let query = websearch::query_from_prompt(&prompt);
+                match websearch::search(&cfg.http, &query).await {
+                    Ok(hits) => {
+                        eprintln!("search \"{query}\": {} kết quả", hits.len());
+                        format!("{}\n\n{prompt}", websearch::format_hits(&query, &hits))
+                    }
+                    Err(err) => {
+                        eprintln!("search error: {err}");
+                        prompt
+                    }
+                }
+            } else {
+                prompt
+            };
+            let _ = channel.broadcast_typing(&ctx.http).await;
 
-        for chunk in split_message(&answer) {
-            if let Err(err) = msg.channel_id.say(&ctx.http, chunk).await {
-                eprintln!("reply failed: {err}");
+            let history = {
+                let mut map = HISTORY.lock().await;
+                let queue = map.entry(channel).or_default();
+                queue.push_back(ChatMessage::user(&prompt, &pending.images));
+                while queue.len() > HISTORY_LIMIT {
+                    queue.pop_front();
+                }
+                queue.iter().cloned().collect::<Vec<_>>()
+            };
+
+            let started = std::time::Instant::now();
+            let answer = match cfg.chat(&history).await {
+                Ok(answer) => answer,
+                Err(err) => {
+                    eprintln!("chat error: {err}");
+                    FALLBACK.to_string()
+                }
+            };
+            eprintln!("reply in {}ms", started.elapsed().as_millis());
+
+            // ponytail: hai tin nhắn cùng kênh có thể xen kẽ nhau; hàng đợi tuần tự theo kênh là bước nâng cấp.
+            {
+                let mut map = HISTORY.lock().await;
+                let queue = map.entry(channel).or_default();
+                queue.push_back(ChatMessage::new("assistant", answer.clone()));
+                while queue.len() > HISTORY_LIMIT {
+                    queue.pop_front();
+                }
             }
-        }
+
+            for chunk in split_message(&answer) {
+                if let Err(err) = channel.say(&ctx.http, chunk).await {
+                    eprintln!("reply failed: {err}");
+                }
+            }
+        });
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         let Interaction::Command(command) = interaction else {
             return;
         };
+        // /search cần defer vì tra web + gọi AI lâu hơn hạn 3s của Discord.
+        if command.data.name == "search" {
+            let query = command
+                .data
+                .options
+                .first()
+                .and_then(|o| o.value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let http = ctx.http.clone();
+            let cfg = self.cfg.clone();
+            let deferred = CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new());
+            if let Err(err) = command.create_response(&ctx.http, deferred).await {
+                eprintln!("defer failed: {err}");
+                return;
+            }
+            tokio::spawn(async move {
+                let answer = match websearch::search(&cfg.http, &query).await {
+                    Ok(hits) => {
+                        let context = websearch::format_hits(&query, &hits);
+                        let messages = vec![
+                            ChatMessage::new("system", &cfg.system),
+                            ChatMessage::user(&context, &[]),
+                        ];
+                        match cfg.chat(&messages).await {
+                            Ok(text) => text,
+                            Err(err) => {
+                                eprintln!("search chat error: {err}");
+                                // Vẫn trả kết quả thô để sensei không mất thông tin.
+                                context
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("search error: {err}");
+                        "Huhu em không tra được gì hết sensei yêu quý ơi, thầy thử lại sau nhé!".to_string()
+                    }
+                };
+                let followup = CreateInteractionResponseFollowup::new().content(answer);
+                if let Err(err) = command.create_followup(&http, followup).await {
+                    eprintln!("search followup failed: {err}");
+                }
+            });
+            return;
+        }
+
         let content = match command.data.name.as_str() {
             "ping" => "Pong!".to_string(),
             "reset" => {
@@ -472,9 +690,53 @@ mod tests {
     }
 
     #[test]
-    fn strips_bot_mention() {
+    fn strips_bot_mention_and_reads_emoji() {
         let id = UserId::new(1570293369844932728);
-        assert_eq!(strip_mentions(&format!("<@{id}> chào em"), id).trim(), "chào em");
+        let (text, has) = render_content(&format!("<@{id}> chào em"), id, &[]);
+        assert_eq!(text, "chào em");
+        assert!(has);
+
+        // Custom emoji: đọc được tên, và tin chỉ có emoji thì không có nội dung thật.
+        let (text, has) = render_content("<:Seia:1530583004869558392>", id, &[]);
+        assert_eq!(text, ":Seia:");
+        assert!(!has, "emoji-only phải bị coi là không có nội dung");
+    }
+
+    #[test]
+    fn reads_animated_emoji_and_rejects_fake_ones() {
+        assert_eq!(emoji_name("a:Seia:1530583004869558392"), Some("Seia"));
+        assert_eq!(emoji_name(":Seia:1530583004869558392"), Some("Seia"));
+        assert_eq!(emoji_name("chữ thường"), None);
+        assert_eq!(emoji_name(":Seia:khong-phai-id"), None);
+    }
+
+    #[test]
+    fn resolves_known_mention_to_name() {
+        let bot = UserId::new(1);
+        let mut other = serenity::model::user::User::default();
+        other.id = UserId::new(42);
+        other.name = "vinh".into();
+        let (text, has) = render_content("<@42> ơi", bot, std::slice::from_ref(&other));
+        assert_eq!(text, "@vinh ơi");
+        assert!(has);
+    }
+
+    #[tokio::test]
+    async fn groups_messages_until_window_closes() {
+        let channel = ChannelId::new(999);
+        {
+            let mut map = PENDING.lock().await;
+            let pending = map.entry(channel).or_default();
+            pending.generation = 7;
+            pending.lines.push("a: tin 1".into());
+            pending.lines.push("a: tin 2".into());
+        }
+        // Task cũ (generation lệch) không được lấy cụm.
+        assert!(take_ready(channel, 6).await.is_none());
+        let taken = take_ready(channel, 7).await.expect("generation khớp thì lấy được");
+        assert_eq!(taken.lines, vec!["a: tin 1", "a: tin 2"]);
+        // Lấy rồi thì cụm biến mất.
+        assert!(take_ready(channel, 7).await.is_none());
     }
 
     #[test]

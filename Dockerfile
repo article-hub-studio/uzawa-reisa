@@ -16,6 +16,9 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/uzawa-reisa /usr/local/bin/uzawa-reisa
+# Instruction/skill của Reisa: sửa file là đổi tính cách, không cần build lại.
+COPY --chown=10001:10001 prompts /app/prompts
 RUN useradd --system --uid 10001 bot
 USER bot
+WORKDIR /app
 CMD ["/usr/local/bin/uzawa-reisa"]
